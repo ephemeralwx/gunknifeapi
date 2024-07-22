@@ -6,6 +6,8 @@ import numpy as np
 import json
 import os
 import tempfile
+import io
+import zipfile
 
 app = Flask(__name__)
 
@@ -22,14 +24,16 @@ def process_video():
         return jsonify({'error': 'No selected file'}), 400
 
     if video_file:
-        # Create temporary files for input and output
+        # Create temporary files for input, output, and JSON
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as input_temp, \
              tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as output_temp, \
-             tempfile.NamedTemporaryFile(delete=False, suffix='.json') as json_temp:
+             tempfile.NamedTemporaryFile(delete=False, suffix='.json') as json_temp, \
+             tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as zip_temp:
 
             input_filename = input_temp.name
             output_filename = output_temp.name
             json_filename = json_temp.name
+            zip_filename = zip_temp.name
 
         # Save the uploaded file
         video_file.save(input_filename)
@@ -44,42 +48,48 @@ def process_video():
         out = cv2.VideoWriter(output_filename, fourcc, fps, (width, height))
 
         frame_count = 0
-        process_every_n_frames = 5
-        last_boxes = None
+        chunk_size = 100  # Process 100 frames at a time
         knife_detections = []
 
         while True:
-            ret, frame = video.read()
-            if not ret:
+            frames = []
+            for _ in range(chunk_size):
+                ret, frame = video.read()
+                if not ret:
+                    break
+                frames.append(frame)
+                frame_count += 1
+
+            if not frames:
                 break
 
-            frame_count += 1
-            current_time = frame_count / fps
+            # Process chunk of frames
+            results = model(frames)
 
-            if frame_count % process_every_n_frames == 0:
-                results = model(frame)
-                last_boxes = results[0].boxes.cpu().numpy()
+            for i, result in enumerate(results):
+                current_time = (frame_count - len(frames) + i + 1) / fps
+                frame = frames[i]
 
-                for box in last_boxes:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                    conf = float(box.conf[0])
                     cls = int(box.cls[0])
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f'{model.names[cls]} {conf:.2f}'
+                    cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+
                     if model.names[cls].lower() == 'knife':
                         knife_detections.append({
                             "time": round(current_time, 1),
                             "text": "knife"
                         })
 
-            if last_boxes is not None:
-                for box in last_boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].astype(int)
-                    conf = box.conf[0]
-                    cls = int(box.cls[0])
+                out.write(frame)
 
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                    label = f'{model.names[cls]} {conf:.2f}'
-                    cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-
-            out.write(frame)
+            # Clear memory
+            del frames
+            del results
 
         video.release()
         out.release()
@@ -88,10 +98,23 @@ def process_video():
         with open(json_filename, 'w') as f:
             json.dump(knife_detections, f, indent=2)
 
-        # Clean up the input temp file
+        # Create a zip file containing both the video and JSON
+        with zipfile.ZipFile(zip_filename, 'w') as zipf:
+            zipf.write(output_filename, 'processed_video.mp4')
+            zipf.write(json_filename, 'knife_detections.json')
+
+        # Clean up temporary files
         os.unlink(input_filename)
+        os.unlink(output_filename)
+        os.unlink(json_filename)
 
-        # Send both files as attachments
-        return send_file(output_filename, as_attachment=True, download_name='processed_video.mp4'), \
-               send_file(json_filename, as_attachment=True, download_name='knife_detections.json')
+        # Send the zip file
+        return send_file(
+            zip_filename,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name='processed_results.zip'
+        )
 
+if __name__ == '__main__':
+    app.run(debug=True)
